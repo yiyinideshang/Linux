@@ -1,6 +1,6 @@
 # I/O复用（I/O Multiplexing）
 
-**I/O复用**是一种使单个进程/线程能够同时监控多个I/O文件描述符（如socket、文件、管道等）的机制，当其中任意一个描述符就绪（可读、可写或出现异常）时，程序就能及时处理，从而实现在单线程中处理多个I/O操作。
+**I/O复用**是一种使单个进程/线程能够**同时监控多个I/O文件描述符**（如socket、文件、管道等）的机制，当其中任意一个描述符就绪（可读、可写或出现异常）时，程序就能及时处理，从而实现在单线程中处理多个I/O操作。
 
 ## 核心思想
 - **一个监控者管理多个I/O通道**
@@ -20,6 +20,18 @@ FD_SET(sock2, &read_fds);
 
 select(max_fd + 1, &read_fds, NULL, NULL, NULL);
 ```
+- `FD_ZERO(fd_set *fdse);`//清除fdset的所有位
+- `FD_SET(int fd,fds_set *fdset);`//设置fdset的位fd
+- `FD_CLR(int fd,fd_set *fdset);`//清除fdset的位fd(从集合中移除一个描述符fd)
+
+- `int FD_ISSET(int fd,fd_set *fdset);`//测试fdset的位fd是否被设置（在select返回后，判断某个描述符fd是否依然处于集合中，即事件已发生）
+
+- ## 参数
+
+第一个参数`nfds`：是一个整数值，表示被监视的文件描述符的最大值加1。例如，如果我们要监视的文件描述符有3、5、8，那么最大是8，所以nfds应为9。这样内核就知道需要检查描述符0到8的集合，即使0、1、2、4、6、7 等 6 个无关的描述符没有被监视。
+
+----缺点：每次调用需要复制整个描述符集合
+
 **缺点**：
 
 - **文件描述符数量有限制**（通常1024）
@@ -123,6 +135,60 @@ if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &errlen) == 0) {
 - **`getsockopt`**：读取当前值。
 - **`setsockopt`**：修改选项值。
 - 两者共享相同的 `level` 和 `optname` 命名，参数结构几乎一致，仅 `getsockopt` 的 `optlen` 是 **值-结果参数**，而 `setsockopt` 的 `optlen` 仅用于输入选项长度。
+
+## 使用select
+
+```c
+fd_set readfds;
+int maxfd = listenfd;
+
+while (1) {
+    FD_ZERO(&readfds);
+    FD_SET(listenfd, &readfds);      // 监听新连接
+    for (int i = 0; i < client_count; i++) {
+        FD_SET(client_fd[i], &readfds); // 监听已有客户端
+        if (client_fd[i] > maxfd) maxfd = client_fd[i];
+    }
+
+    int ret = select(maxfd + 1, &readfds, NULL, NULL, NULL);
+    if (ret < 0) {
+        // 错误处理
+    }
+
+    // 检查新连接
+    if (FD_ISSET(listenfd, &readfds)) {
+        int newfd = accept(listenfd, ...);
+        // 添加到 client_fd 数组
+    }
+
+    // 检查每个客户端是否有数据
+    for (int i = 0; i < client_count; i++) {
+        if (FD_ISSET(client_fd[i], &readfds)) {
+            int n = recv(client_fd[i], buf, sizeof(buf), 0);
+            if (n <= 0) {
+                // 关闭连接，从数组中移除
+            } else {
+                // 处理数据（例如广播给其他客户端）
+            }
+        }
+    }
+}
+```
+
+1. **同时监视两种事件**：将监听套接字（新连接）和已连接套接字（客户端数据）都加入 `select` 的读集合，`select` 可以同时等待这两类事件的发生。
+2. **第一个参数**：传入所有被监视描述符中**最大值 + 1**，这是 `select` 的要求，用于限定内核检查的范围。
+3. **事件处理逻辑**：
+   - 如果**监听套接字**可读，说明有**新连接**，调用 `accept` 取出并加入客户端数组。
+   - 如果**某个已连接套接字**可读，说明有**客户端发来数据**，调用 `recv` 处理。
+4. **对比不使用 `select`**：如果不使用多路复用，直接调用 `accept` 会**阻塞**直到有新连接，期间无法处理已连接客户端的读写，CPU 虽然不忙（进程休眠），但服务器失去了响应其他事件的能力。
+5. **使用 `select` 的优势**：如果监听套接字没有触发可读事件（即使没有新连接），`select` 也可能因为已连接套接字可读 而返回，从而执行后续代码（处理客户端数据），避免了长期阻塞在 `accept` 上。
+
+- `select` **本身也会阻塞**：`select` 调用会阻塞直到**至少一个被监视的描述符就绪**。因此程序仍然会“卡”在 select 上，但这次是同时等待多种事件，一旦返回就能区分处理。
+- **CPU 利用率**：阻塞时 该进程让出 CPU，CPU不会空转，这与直接阻塞在 `accept` 类似。
+  - 区别在于：阻塞在 `select` 上可以同时等待多个来源
+  - （在`select`上更不容易阻塞，只要有新连接或者有已经建立的连接就不会阻塞）
+    - 只要有一个被select监视的描述符就绪，就打破阻塞。
+  - 而阻塞在 `accept` 上只能等待新连接。
 
 # 9.2. **poll**
 
@@ -420,10 +486,14 @@ int epoll_create(int size);  // size参数已废弃，但必须大于0
 int epoll_create1(int flags); // flags: 0 或 EPOLL_CLOEXEC
 ```
 
-- 创建epoll实例，返回epoll文件描述符,将其作为其他所有epoll系统调用哦的第一个参数，用来指定要访问的内核事件表。
+- 创建epoll实例，**返回epoll文件描述符epfd**,将其作为其他所有epoll系统调用的第一个参数，用来指定要访问的内核事件表。
 - `epoll_create1(0)`等同于`epoll_create(1)`
 
 ### 2. epoll_ctl
+
+用于向指定的 epoll 实例（由 `epoll_create` 返回的文件描述符 `epfd`）**注册、修改或删除**对某个文件描述符 `fd` 的事件监控。简单来说，它告诉内核：“请开始监控这个 fd 上的某些事件”，或者“请停止监控这个 fd”，又或者“请修改这个 fd 的监控事件类型”。
+
+通过 `epoll_ctl`，可以灵活地管理大量文件描述符，实现高效的 I/O 多路复用。
 
 ```c
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
@@ -453,16 +523,48 @@ typedef union epoll_data {
 } epoll_data_t;
 ```
 
-**events标志：**
+#### **events标志：**
 
-- `EPOLLIN`：可读事件
-- `EPOLLOUT`：可写事件
+- `EPOLLIN`：**可读事件**
+
+#### **可读事件的具体触发条件包括：**
+
+- **可读事件的具体触发条件包括：**
+
+  - 接收缓冲区中有数据（字节数大于等于低水位标记，通常为1）；
+
+  - 对端关闭了连接（此时读取会返回0，表示 EOF）；
+
+  - 监听 socket 上有新的连接请求（accept 可读）；
+
+  - 有错误发生但数据仍可读（如 TCP 带外数据）。
+
+- **默认行为（水平触发，Level-Triggered）**：
+  - 只要文件描述符处于可读状态，`epoll_wait` 就会**持续返回**该事件。这意味着如果你没有把数据读完（或者没有处理完可读条件），下一次调用 `epoll_wait` 仍然会立刻通知你。这种模式简单、不易遗漏事件，但可能会导致频繁唤醒（如果数据一直没读完）。
+
+- `EPOLLOUT`：**可写事件**
 - `EPOLLPRI`：紧急数据可读
 - `EPOLLERR`：错误事件
 - `EPOLLHUP`：挂起事件
+
+
+
 - `EPOLLET`：**边缘触发模式**
+
+  - `EPOLLET` 本身不是一个独立的事件类型，而是一个**模式标志**，通常与 `EPOLLIN`、`EPOLLOUT` 等组合使用（例如 `events = EPOLLIN | EPOLLET`）。它改变了 epoll 的事件通知方式：从水平触发变为**边缘触发**（Edge-Triggered）。
+
+  - **边缘触发的核心规则**：
+    - 只有当被监控的文件描述符的**状态发生变化**（即从“不可读”变为“可读”，或从“不可写”变为“可写”）时，epoll 才会通知应用程序一次。之后即使该描述符依然可读，只要没有新的数据到达（状态没有再次变化），epoll 就不会再产生通知。
+
 - `EPOLLONESHOT`：**一次性事件**
+
 - `EPOLLRDHUP`：对端关闭连接或半关闭
+
+#### 注意事项
+
+- 同一个 `fd` 不能重复添加（除非先删除再添加），否则会返回 `EEXIST` 错误。
+- 修改事件时，`fd` 必须已经注册过。
+- `epoll_ctl` 是同步操作，成功返回 0，失败返回 -1 并设置 `errno`。
 
 ### 3. epoll_wait
 
@@ -473,7 +575,7 @@ int epoll_wait(int epfd, struct epoll_event *events,
                int maxevents, int timeout);
 ```
 
-- 等待事件发生
+- **等待事件发生**
 - `timeout`：-1阻塞，0立即返回，>0毫秒数；与poll接口的timeout参数相同
 - `maxevents`：指定最多监听多少个事件，必须大于0。
 - `events`：这个函数一旦检测到事件，就将所有就绪的事件从 内核事件表(epfd指定的那个)中 复制到第二个参数 events指向的数组中。 这个数组只用于输出epoll_wait检测到的就绪事件，而不像select和poll的数组参数那样既用于传入用户注册 事件，又用于输出内核检测到的就绪行事件。这样极大地提高了应用程序索引就绪文件描述符的效率
@@ -501,7 +603,7 @@ int epoll_wait(int epfd, struct epoll_event *events,
 **优势**：
 
 - 事件驱动，只返回就绪的描述符
-- 支持边缘触发（ET）和水平触发（LT）模式
+- 支持**边缘触发**（ET）和**水平触发**（LT）模式
 - 高性能，适合大量并发连接
 
 epoll是现代Linux高性能网络编程的核心技术，理解其工作原理和正确使用各种模式，是构建高性能服务器的关键。
@@ -522,6 +624,77 @@ int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
 ```
 ## LT和ET模式
 
-```c
-```
+**默认行为（水平触发，Level-Triggered）**：
 
+- 只要文件描述符处于可读状态，`epoll_wait` 就会**持续返回**该事件。这意味着如果你没有把数据读完（或者没有处理完可读条件），下一次调用 `epoll_wait` 仍然会立刻通知你。这种模式简单、不易遗漏事件，但可能会导致频繁唤醒（如果数据一直没读完）。
+
+**非默认行为**（**边缘触发，Edge-Triggered**）：
+
+- `EPOLLET` 本身不是一个独立的事件类型，而是一个**模式标志**，通常与 `EPOLLIN`、`EPOLLOUT` 等组合使用（例如 `events = EPOLLIN | EPOLLET`）。它改变了 epoll 的事件通知方式：从水平触发变为**边缘触发**（Edge-Triggered）。
+- **边缘触发的核心规则**：
+  - 只有当被监控的文件描述符的**状态发生变化**（即从“不可读”变为“可读”，或从“不可写”变为“可写”）时，epoll 才会通知应用程序一次。之后即使该描述符依然可读，只要没有新的数据到达（状态没有再次变化），epoll 就不会再产生通知。
+
+**形象理解**：
+
+- 水平触发（LT）：门一直开着，只要屋里有人（数据），你就不断被提醒。
+- 边缘触发（ET）：门只在打开的那一瞬间提醒你一次，之后就算屋里一直有人，也不会再提醒，直到门再次关闭又打开（新数据到达）。
+
+### EPOLLIN | EPOLLET 的结合使用
+
+将 `EPOLLIN` 和 `EPOLLET` 组合，表示**以边缘触发的方式监听可读事件**。这种模式在高性能网络服务器中很常见，因为它可以减少 epoll 事件通知的次数，提升并发处理能力。但使用边缘触发时，开发者需要遵循一些重要准则：
+
+- **必须非阻塞**：通常配合非阻塞 I/O 使用，因为一旦事件触发，你需要**循环读取**直到返回 `EAGAIN`（表示当前无数据可读），否则可能遗漏剩余数据。
+- **一次性读完**：在收到可读事件后，要在一个循环内尽可能多地读取数据（例如反复调用 `read`/`recv`），直到返回 `EAGAIN`，确保内核缓冲区被清空，以便下一次新数据到达时能正确触发新事件。
+- **小心处理饥饿**：由于只通知一次，如果读取不彻底，剩余数据将一直留在缓冲区，但 epoll 不会再通知，导致数据“饿死”。
+
+# 常见的`errno`错误码
+
+| 错误码名称                   | 数值 | 含义                                                         | 常见触发场景                                                 |
+| :--------------------------- | :--- | :----------------------------------------------------------- | :----------------------------------------------------------- |
+| **EPERM**                    | 1    | 操作不允许（Operation not permitted）                        | 需要超级用户权限的操作，但当前用户权限不足。                 |
+| **ENOENT**                   | 2    | 没有那个文件或目录（No such file or directory）              | 打开不存在的文件、访问不存在的路径。                         |
+| **EINTR**                    | 4    | 系统调用被信号中断（Interrupted system call）                | 阻塞的系统调用（如 `read`、`write`、`accept`）在执行期间收到了信号。 |
+| **EIO**                      | 5    | I/O 错误（I/O error）                                        | 底层硬件或文件系统错误，如磁盘坏道。                         |
+| **EBADF**                    | 9    | 坏的文件描述符（Bad file descriptor）                        | 使用未打开或已关闭的文件描述符进行操作。                     |
+| **EAGAIN** / **EWOULDBLOCK** | 11   | 资源暂时不可用，操作会阻塞（Resource temporarily unavailable） | 非阻塞模式下，读无数据、写缓冲区满、`accept` 无新连接、`connect` 未完成等。 |
+| **ENOMEM**                   | 12   | 无法分配内存（Cannot allocate memory）                       | 系统内存不足，或进程虚拟内存限制达到上限。                   |
+| **EACCES**                   | 13   | 权限不足（Permission denied）                                | 文件或目录没有读/写/执行权限，或缺少搜索权限。               |
+| **EFAULT**                   | 14   | 错误的地址（Bad address）                                    | 指针参数指向了非法内存区域（如未映射的地址）。               |
+| **EBUSY**                    | 16   | 设备或资源忙（Device or resource busy）                      | 尝试挂载已挂载的设备、删除正在使用的文件等。                 |
+| **EEXIST**                   | 17   | 文件已存在（File exists）                                    | 使用 `O_CREAT` 和 `O_EXCL` 创建文件时文件已存在。            |
+| **ENODEV**                   | 19   | 没有此设备（No such device）                                 | 指定的设备文件不存在或对应的驱动未加载。                     |
+| **ENOTDIR**                  | 20   | 不是目录（Not a directory）                                  | 在非目录的文件上执行了目录操作（如 `chdir`）。               |
+| **EISDIR**                   | 21   | 是目录（Is a directory）                                     | 在目录上执行了文件写操作（如 `write`），但目录不支持写入。   |
+| **EINVAL**                   | 22   | 无效参数（Invalid argument）                                 | 传给系统调用的参数非法，如错误的 `flags`、不合法的值等。     |
+| **ENFILE**                   | 23   | 系统文件表已满（File table overflow）                        | 整个系统打开的文件描述符总数达到上限。                       |
+| **EMFILE**                   | 24   | 进程文件描述符表已满（Too many open files）                  | 当前进程打开的文件描述符数量已达到 `RLIMIT_NOFILE` 限制。    |
+| **ENOSPC**                   | 28   | 设备上无空间（No space left on device）                      | 磁盘已满，无法写入更多数据。                                 |
+| **EPIPE**                    | 32   | 管道损坏（Broken pipe）                                      | 向已关闭读端的管道或 socket 写入数据，会导致进程收到 `SIGPIPE` 信号。 |
+| **ERANGE**                   | 34   | 结果太大（Numerical result out of range）                    | 数学函数结果超出可表示范围，或字符串转换超出类型范围。       |
+| **ENOSYS**                   | 38   | 功能未实现（Function not implemented）                       | 调用了内核未编译支持的系统调用。                             |
+| **ENOTSOCK**                 | 88   | 不是套接字（Socket operation on non-socket）                 | 在非 socket 文件描述符上执行 socket 操作（如 `bind`、`listen`）。 |
+| **EDESTADDRREQ**             | 89   | 需要目标地址（Destination address required）                 | 在未连接的 socket 上发送数据，但没有指定目标地址（如未调用 `connect`）。 |
+| **EMSGSIZE**                 | 90   | 消息过长（Message too long）                                 | 发送的数据报超过 socket 的最大传输单元（MTU）。              |
+| **EPROTOTYPE**               | 91   | 协议类型错误（Protocol wrong type for socket）               | socket 类型与协议不匹配（如为 SOCK_STREAM 指定了 UDP 协议）。 |
+| **ENOPROTOOPT**              | 92   | 协议不可用（Protocol not available）                         | 设置了不支持的 socket 选项（如 `setsockopt` 使用无效选项）。 |
+| **EPROTONOSUPPORT**          | 93   | 协议不支持（Protocol not supported）                         | 请求的协议（如指定 IPPROTO_SCTP）在内核中未实现。            |
+| **EOPNOTSUPP**               | 95   | 操作不支持（Operation not supported）                        | 在 socket 上执行不支持的操作（如在 TCP 上调用多播相关选项）。 |
+| **EAFNOSUPPORT**             | 97   | 地址族不支持（Address family not supported by protocol）     | 使用了协议不支持的地址族（如在 IPv4 socket 上传递 IPv6 地址）。 |
+| **EADDRINUSE**               | 98   | 地址已使用（Address already in use）                         | `bind` 时端口或地址已被占用，且未设置 `SO_REUSEADDR`。       |
+| **EADDRNOTAVAIL**            | 99   | 地址不可用（Cannot assign requested address）                | 绑定的 IP 地址不属于本地主机（例如绑定到非本地 IP）。        |
+| **ENETDOWN**                 | 100  | 网络未启动（Network is down）                                | 网络接口已关闭或不可用。                                     |
+| **ENETUNREACH**              | 101  | 网络不可达（Network is unreachable）                         | 路由表中没有到目标网络的路径。                               |
+| **ECONNABORTED**             | 103  | 连接中止（Software caused connection abort）                 | 对端异常关闭连接（如超时、重传失败）。                       |
+| **ECONNRESET**               | 104  | 连接重置（Connection reset by peer）                         | 对端突然关闭连接（如进程崩溃、发送 RST 包）。                |
+| **ENOBUFS**                  | 105  | 无缓冲区空间（No buffer space available）                    | 系统内存不足，无法分配网络缓冲区。                           |
+| **EISCONN**                  | 106  | 套接字已连接（Transport endpoint is already connected）      | 对已连接的 socket 再次调用 `connect`。                       |
+| **ENOTCONN**                 | 107  | 套接字未连接（Transport endpoint is not connected）          | 在未建立连接的 socket 上执行读写操作（通常 TCP 会触发）。    |
+| **ETIMEDOUT**                | 110  | 连接超时（Connection timed out）                             | 连接建立或数据传输超时（如长时间未收到对端确认）。           |
+| **ECONNREFUSED**             | 111  | 连接拒绝（Connection refused）                               | 目标端口上没有监听服务，或目标主动拒绝连接（发送 RST）。     |
+| **EHOSTUNREACH**             | 113  | 主机不可达（No route to host）                               | 路由表中没有到目标主机的路由。                               |
+| **EINPROGRESS**              | 115  | 操作正在进行中（Operation now in progress）                  | 非阻塞 `connect` 正在建立连接，尚未完成。                    |
+| **EDQUOT**                   | 122  | 磁盘配额超限（Disk quota exceeded）                          | 写入文件时超出用户或组的磁盘配额限制。                       |
+
+- 当 `accept` 返回 `EAGAIN` 或 `EWOULDBLOCK` 时，表示已完成连接队列已空，应结束循环等待下一次事件。
+- 当 `recv` 返回 `ECONNRESET` 时，说明对端已关闭连接，应关闭相应 socket。
+- 当 `send` 返回 `EPIPE` 时，通常应捕获 `SIGPIPE` 信号或忽略该错误，避免进程意外退出。
