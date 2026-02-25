@@ -1,4 +1,8 @@
+# I/O复用的高级应用一：非阻塞connect
+
 # 代码示例
+
+> 代码清单 9-5 非阻塞connect
 
 ````c
 #include <sys/types.h>
