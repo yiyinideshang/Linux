@@ -17,16 +17,17 @@ static int connfd;
 //SIGURG信号的处理函数
 void sig_urg(int sig)
 {
-    ubt save_errno = errno;
+    int save_errno = errno;
     char buffer[BUF_SIZE];
     memset(buffer,'\0',BUF_SIZE);
     int ret = recv(connfd,buffer,BUF_SIZE-1,MSG_OOB);//接受带外数据
     printf("got %d bytes of oob data '%s'\n",ret,buffer);
+    fflush(stdout);
     errno = save_errno;
 }
 
 //设置信号处理函数
-void addsig(int sig)
+void addsig(int sig,void(*sig_handler)(int))
 {
     struct sigaction sa;
     memset(&sa,'\0',sizeof(sa));
@@ -36,24 +37,24 @@ void addsig(int sig)
     assert(sigaction(sig,&sa,NULL) != -1);
 }
 
-int main(int argc,,char* argv[])
+int main(int argc,char* argv[])
 {
     if(argc <= 2)
     {
         printf("usage:%s ip_address port_number\n",basename(argv[0]));
-        return -1;
+        return 1;
     }
     const char* ip = argv[1];
     int port = atoi(argv[2]);
 
     struct sockaddr_in address;
     bzero(&address,sizeof(address));
-    address.sin_family - AF_INET;
+    address.sin_family = AF_INET;
     inet_pton(AF_INET,ip,&address.sin_addr);
     address.sin_port = htons(port);
 
     int sock = socket(PF_INET,SOCK_STREAM,0);
-    assert(sockf>=0);
+    assert(sock>=0);
 
     int ret = bind(sock,(struct sockaddr*)&address,sizeof(address));
     assert(ret != -1);
@@ -63,7 +64,7 @@ int main(int argc,,char* argv[])
 
     struct sockaddr_in client;
     socklen_t client_addrlength = sizeof(client);
-    connfd == accept(sock,(struct sockaddr*)&client,&client_addrlength);
+    connfd = accept(sock,(struct sockaddr*)&client,&client_addrlength);
     if(connfd<0)
     {
         printf("errno is:%d\n",errno);
@@ -72,7 +73,11 @@ int main(int argc,,char* argv[])
     {
         addsig(SIGURG,sig_urg);
         //使用SIGURG信号前，必须设置socket的宿主进程或进程组
-        fcntl(connfd,__F_SETOWN,getpid());
+        if (fcntl(connfd, F_SETOWN, getpid()) == -1) 
+        {
+            perror("fcntl F_SETOWN");
+            // 处理错误
+        }
 
         char buffer[BUF_SIZE];
         while(1)
